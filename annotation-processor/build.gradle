@@ -1,0 +1,9 @@
+plugins {
+    id 'java'
+}
+
+dependencies {
+    annotationProcessor 'com.google.auto.service:auto-service:1.0-rc5'
+    compile 'com.google.auto.service:auto-service:1.0-rc5'
+    compile 'com.squareup:javapoet:1.9.0'
+}

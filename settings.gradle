@@ -1,0 +1,4 @@
+rootProject.name = 'functools'
+include 'annotation-processor'
+include 'annotation-user'
+
