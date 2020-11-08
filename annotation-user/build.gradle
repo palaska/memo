@@ -1,4 +1,6 @@
 dependencies {
     annotationProcessor project(":annotation-processor")
     compileOnly project(":annotation-processor")
+
+    compile 'com.google.guava:guava:11.0.2'
 }

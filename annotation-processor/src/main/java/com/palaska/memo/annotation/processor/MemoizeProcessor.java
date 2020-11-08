@@ -3,28 +3,31 @@ package com.palaska.memo.annotation.processor;
 import javax.annotation.processing.*;
 import javax.lang.model.SourceVersion;
 import javax.lang.model.element.*;
+import javax.lang.model.type.NoType;
 import javax.lang.model.type.TypeMirror;
 import javax.tools.JavaFileObject;
-
 import com.google.auto.service.AutoService;
 import com.google.common.base.Preconditions;
-import com.google.common.cache.LoadingCache;
+import com.google.common.cache.Cache;
+import com.google.common.cache.CacheBuilder;
 import com.squareup.javapoet.*;
 
 import java.io.IOException;
 import java.io.PrintWriter;
-import java.lang.reflect.Type;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
-import java.util.function.Supplier;
+import java.util.stream.Collector;
 import java.util.stream.Collectors;
 
 @SupportedAnnotationTypes("com.palaska.memo.annotation.processor.Memoize")
 @SupportedSourceVersion(SourceVersion.RELEASE_15)
 @AutoService(Processor.class)
 public class MemoizeProcessor extends AbstractProcessor {
+
+    private static final String ORIGINAL_INSTANCE = "__original";
+    private static final String GENERATED_CLASS_SUFFIX = "Memoized";
+
     @Override
     public boolean process(Set<? extends TypeElement> annotations, RoundEnvironment roundEnv) {
         for (TypeElement annotation: annotations) {
@@ -47,39 +50,83 @@ public class MemoizeProcessor extends AbstractProcessor {
         return true;
     }
 
-    private void generateMemoizedClass(TypeElement cls, ExecutableElement constructor, Set<? extends Element> methods) throws IOException {
-        Set<MethodSpec> methodSpecs = methods.stream()
-                .map(MemoizeProcessor::getMethodSpec)
+    private void generateMemoizedClass(TypeElement cls, ExecutableElement constructor, Set<? extends Element> annotatedMethods) throws IOException {
+        Preconditions.checkArgument(!cls.getModifiers().contains(Modifier.ABSTRACT), "@Memoize annotation cannot be used in abstract classes.");
+        Preconditions.checkArgument(!cls.getModifiers().contains(Modifier.STATIC), "@Memoize annotation cannot be used in static classes.");
+        Preconditions.checkArgument(!cls.getModifiers().contains(Modifier.PRIVATE), "@Memoize annotation cannot be used in private classes.");
+
+        Set<MethodSpec> methodSpecs = annotatedMethods.stream()
+                .map(s -> MemoizeProcessor.getMethodSpec(s, cls))
                 .collect(Collectors.toSet());
 
         MethodSpec constructorSpec = getConstructorSpec(cls, constructor, methodSpecs);
 
-
-        TypeSpec generatedClass = TypeSpec.classBuilder(cls.getSimpleName() + "Memoized")
+        TypeSpec generatedClass = TypeSpec.classBuilder(cls.getSimpleName() + GENERATED_CLASS_SUFFIX)
+                .addAnnotation(AnnotationSpec.builder(Generated.class).addMember("value", CodeBlock.builder().add("\"Memoize.generator\"").build()).build())
                 .addModifiers(MemoizeProcessor.getModifiers(cls.getModifiers()))
                 .addMethod(constructorSpec)
                 .addMethods(methodSpecs)
-                .addField(TypeName.get(cls.asType()), "_original", Modifier.PRIVATE, Modifier.FINAL)
+                .addMethods(nonAnnotatedMethods(cls))
+//                .addStaticBlock(CodeBlock.builder().add(nonAnnotatedMethods(cls)).build())
+                .addMethods(helperMethods())
+                .addField(TypeName.get(cls.asType()), ORIGINAL_INSTANCE, Modifier.PRIVATE, Modifier.FINAL)
                 .addFields(caches(methodSpecs))
                 .build();
 
-        JavaFileObject builderFile = processingEnv.getFiler().createSourceFile(cls.getSimpleName() + "Memoized");
+        JavaFileObject builderFile = processingEnv.getFiler().createSourceFile(generatedClassName(cls));
         JavaFile javaFile = JavaFile.builder(ProcessorUtils.packageName(cls), generatedClass)
                 .build();
 
         try (PrintWriter out = new PrintWriter(builderFile.openWriter())) {
-            FileWriter w = new FileWriter(out);
             out.println(javaFile);
-
-//            w.printPackageName(className);
         }
+    }
+
+    private static Set<MethodSpec> nonAnnotatedMethods(TypeElement cls) {
+        return cls.getEnclosedElements()
+                .stream()
+                .filter(element -> element.getKind().equals(ElementKind.METHOD))
+                .filter(element -> !element.getModifiers().contains(Modifier.PRIVATE))
+                .filter(element -> element.getAnnotation(Memoize.class) == null)
+                .map(element -> (ExecutableElement) element)
+                .map(MemoizeProcessor::forwardMethod)
+                .collect(Collectors.toSet());
+    }
+
+    private static MethodSpec forwardMethod(ExecutableElement m) {
+        List<ParameterSpec> parameterSpecs = m.getParameters()
+                .stream()
+                .map(MemoizeProcessor::getParameterSpec)
+                .collect(Collectors.toList());
+
+        return MethodSpec.methodBuilder(m.getSimpleName().toString())
+                .addModifiers(m.getModifiers())
+                .returns(TypeName.get(m.getReturnType()))
+                .addParameters(parameterSpecs)
+                .addExceptions(getExceptionTypes(m))
+                .addCode(forwardMethodCode(m, parameterSpecs))
+                .build();
+    }
+
+    private static CodeBlock forwardMethodCode(ExecutableElement m, List<ParameterSpec> parameterSpecs) {
+        boolean isStatic = m.getModifiers().contains(Modifier.STATIC);
+        boolean isVoid = TypeName.get(m.getReturnType()).equals(TypeName.VOID);
+
+        String className = m.getEnclosingElement().getSimpleName().toString();
+        String paramNames = parameterSpecs.stream().map(s -> s.name).collect(Collectors.joining(", "));
+
+        return CodeBlock.builder()
+                .add(isVoid ? "" : "return ")
+                .add(isStatic ? className : ORIGINAL_INSTANCE)
+                .add("." + m.getSimpleName() + "(" + paramNames + ");\n")
+                .build();
     }
 
     private static Set<FieldSpec> caches(Set<MethodSpec> methodSpecs) {
         return methodSpecs
                 .stream()
                 .map(s -> FieldSpec.builder(
-                        LoadingCache.class,
+                        ParameterizedTypeName.get(ClassName.get(Cache.class), TypeName.get(String.class), s.returnType.box()),
                         methodCacheId(s.name, s.returnType, s.modifiers, s.parameters),
                         Modifier.PRIVATE, Modifier.FINAL).build())
                 .collect(Collectors.toSet());
@@ -89,7 +136,6 @@ public class MemoizeProcessor extends AbstractProcessor {
         Modifier[] result = new Modifier[modifiers.size()];
 
         int i = 0;
-
         for (Modifier modifier : modifiers) {
             result[i] = modifier;
             i += 1;
@@ -108,20 +154,26 @@ public class MemoizeProcessor extends AbstractProcessor {
                 .addModifiers(el.getModifiers())
                 .addParameters(parameterSpecs)
                 .addExceptions(getExceptionTypes(el))
-                .addStatement("this._original = new $N(" + String.join(",", parameterSpecs.stream().map(spec -> spec.name).collect(Collectors.toSet())) + ")", cls.getSimpleName())
+                .addStatement("this.$L = new $N(" + String.join(",", parameterSpecs.stream().map(spec -> spec.name).collect(Collectors.toSet())) + ")", ORIGINAL_INSTANCE, cls.getSimpleName())
                 .addCode(cacheInitializations(methods))
                 .build();
     }
 
-    private static String cacheInitializations(Set<MethodSpec> methods) {
+    private static CodeBlock cacheInitializations(Set<MethodSpec> methods) {
         return methods
                 .stream()
-                .map(s -> "this." + methodCacheId(s.name, s.returnType, s.modifiers, s.parameters) + " = new LoadingCache<int, " + s.returnType + ">()")
-                .collect(Collectors.joining(";\n")) + ";\n";
+                .map(s -> CodeBlock.builder()
+                        .add("this." + methodCacheId(s.name, s.returnType, s.modifiers, s.parameters) + " = $T.newBuilder()", CacheBuilder.class)
+                        .add("\n  .build();\n")
+                        .build())
+                .reduce((a, b) -> a.toBuilder().add(b).build())
+                .orElseGet(() -> CodeBlock.builder().build());
     }
 
-    private static MethodSpec getMethodSpec(Element element) {
+    private static MethodSpec getMethodSpec(Element element, TypeElement cls) {
         Preconditions.checkArgument(element.getKind().equals(ElementKind.METHOD), "@Memoize annotation can only be used with methods.");
+        Preconditions.checkArgument(!element.getModifiers().contains(Modifier.PRIVATE), "@Memoize annotation cannot be used with private methods.");
+        Preconditions.checkArgument(!element.getModifiers().contains(Modifier.STATIC), "@Memoize annotation cannot be used with static methods.");
 
         ExecutableElement el = (ExecutableElement) element;
         List<ParameterSpec> parameterSpecs = el.getParameters()
@@ -130,17 +182,53 @@ public class MemoizeProcessor extends AbstractProcessor {
                 .collect(Collectors.toList());
 
         String name = el.getSimpleName().toString();
+        String paramNames = parameterSpecs.stream().map(s -> s.name).collect(Collectors.joining(", "));
         Set<Modifier> modifiers = el.getModifiers();
         TypeName returns = TypeName.get(el.getReturnType());
+        String cacheId = methodCacheId(name, returns, modifiers, parameterSpecs);
 
         return MethodSpec.methodBuilder(name)
                 .addModifiers(modifiers)
                 .addParameters(parameterSpecs)
                 .returns(returns)
                 .addExceptions(getExceptionTypes(el))
-                .addCode("this." + methodCacheId(name, returns, modifiers, parameterSpecs) + ".get();")
-                .addCode("\n")
+                .addCode("String cacheKey = " + generatedClassName(cls) + ".cacheKey(" + paramNames + ");\n")
+                .addCode("$T result = this." + cacheId + ".getIfPresent(cacheKey);\n", returns.box())
+                .addCode(CodeBlock.builder()
+                        .add("\n")
+                        .beginControlFlow("if (result != null)")
+                        .addStatement("return result")
+                        .endControlFlow()
+                        .add("\n")
+                        .build())
+                .addCode("$T computed = " + ORIGINAL_INSTANCE + "." + name + "(" + paramNames + ");\n", returns)
+                .addCode("this." + cacheId + ".put(cacheKey, computed);\n")
+                .addCode("return computed;\n")
                 .build();
+    }
+
+    private static String generatedClassName(TypeElement cls) {
+        return cls.getSimpleName() + GENERATED_CLASS_SUFFIX;
+    }
+
+    private static Set<MethodSpec> helperMethods() {
+        MethodSpec hashAll = MethodSpec.methodBuilder("hashAll")
+                .varargs()
+                .addModifiers(Modifier.PRIVATE, Modifier.STATIC)
+                .returns(String.class)
+                .addParameter(Object[].class, "args")
+                .addCode("return \"_\" + $T.toUnsignedLong($T.hash(args));\n", Integer.class, Objects.class)
+                .build();
+
+        MethodSpec cacheKey = MethodSpec.methodBuilder("cacheKey")
+                .varargs()
+                .addModifiers(Modifier.PRIVATE, Modifier.STATIC)
+                .returns(String.class)
+                .addParameter(Object[].class, "args")
+                .addCode("return \"_key\" + hashAll(args);\n")
+                .build();
+
+        return Set.of(hashAll, cacheKey);
     }
 
     private static List<TypeName> getExceptionTypes(ExecutableElement el) {
@@ -168,30 +256,11 @@ public class MemoizeProcessor extends AbstractProcessor {
     }
 
     private static String methodCacheId(String name, TypeName returnType, Set<Modifier> modifiers, List<ParameterSpec> parameterSpecs) {
-        return "_cache_" + Integer.toUnsignedLong(Objects.hash(name, returnType, modifiers, parameterSpecs));
+        return "_cache" + hashAll(name, returnType, modifiers, parameterSpecs);
     }
 
-    class FileWriter {
-        private final PrintWriter writer;
-
-        FileWriter(PrintWriter writer) {
-            this.writer = writer;
-        }
-
-        void printPackageName(String className) {
-            String packageName = null;
-            int lastDot = className.lastIndexOf('.');
-            if (lastDot > 0) {
-                packageName = className.substring(0, lastDot);
-            }
-
-            if (packageName != null) {
-                writer.print("package ");
-                writer.print(packageName);
-                writer.println(";");
-                writer.println();
-            }
-        }
+    private static String hashAll(Object... args) {
+        return "_" + Integer.toUnsignedLong(Objects.hash(args));
     }
 }
 
